@@ -81,7 +81,7 @@ function flushRelay(): void {
 
   for (const { prefix, text } of messages) {
     // Tool calls are short — send as plain text, no markdown conversion
-    if (prefix === '🛠️') {
+    if (prefix === '\u{1203C}') {
       for (const chat_id of access.allowFrom) {
         void bot.api.sendMessage(chat_id, `${prefix} ${text}`).catch(err => {
           process.stderr.write(`telegram channel: transcript relay failed: ${err}\n`)
@@ -159,7 +159,7 @@ function startTailing(session: ActiveSession): void {
 
           for (const block of content) {
             if (block.type === 'text' && block.text?.trim()) {
-              const prefix = stopReason === 'end_turn' ? '✅' : '💭'
+              const prefix = stopReason === 'end_turn' ? '\u{12077}' : '\u{1202D}'
               queueRelay(prefix, block.text.trim())
             } else if (block.type === 'tool_use') {
               const name = block.name || 'unknown'
@@ -178,7 +178,7 @@ function startTailing(session: ActiveSession): void {
               } else if (input.query) {
                 detail = `: ${input.query}`
               }
-              queueRelay('🛠️', `${name}${detail}`)
+              queueRelay('\u{1203C}', `${name}${detail}`)
             }
           }
         } catch {
