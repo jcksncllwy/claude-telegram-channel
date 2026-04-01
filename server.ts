@@ -49,6 +49,8 @@ let tailOffset = 0
 let tailInterval: ReturnType<typeof setInterval> | null = null
 let pendingMessages: Array<{ prefix: string; text: string }> = []
 let debounceTimer: ReturnType<typeof setTimeout> | null = null
+// Map tool_use IDs to tool names for pairing with tool_result
+const pendingToolCalls = new Map<string, string>()
 
 function readActiveSession(): ActiveSession | null {
   try {
@@ -151,34 +153,57 @@ function startTailing(session: ActiveSession): void {
         if (!line.trim()) continue
         try {
           const entry = JSON.parse(line)
-          if (entry.type !== 'assistant') continue
           const msg = entry.message
           const content = msg?.content
           if (!Array.isArray(content)) continue
-          const stopReason = msg?.stop_reason
 
-          for (const block of content) {
-            if (block.type === 'text' && block.text?.trim()) {
-              const prefix = stopReason === 'end_turn' ? '\u{12077}' : '\u{1202D}'
-              queueRelay(prefix, block.text.trim())
-            } else if (block.type === 'tool_use') {
-              const name = block.name || 'unknown'
-              const input = block.input ?? {}
-              // Build a concise tool summary
-              let detail = ''
-              if (input.description) {
-                detail = `: ${input.description}`
-              } else if (input.command) {
-                const cmd = String(input.command)
-                detail = `: ${cmd.length > 80 ? cmd.slice(0, 80) + '…' : cmd}`
-              } else if (input.pattern) {
-                detail = `: ${input.pattern}`
-              } else if (input.file_path) {
-                detail = `: ${input.file_path}`
-              } else if (input.query) {
-                detail = `: ${input.query}`
+          if (entry.type === 'assistant') {
+            const stopReason = msg?.stop_reason
+
+            for (const block of content) {
+              if (block.type === 'text' && block.text?.trim()) {
+                const prefix = stopReason === 'end_turn' ? '\u{12077}' : '\u{1202D}'
+                queueRelay(prefix, block.text.trim())
+              } else if (block.type === 'tool_use') {
+                const name = block.name || 'unknown'
+                const id = block.id || ''
+                const input = block.input ?? {}
+                if (id) pendingToolCalls.set(id, name)
+                // Build a concise tool summary
+                let detail = ''
+                if (input.description) {
+                  detail = `: ${input.description}`
+                } else if (input.command) {
+                  const cmd = String(input.command)
+                  detail = `: ${cmd.length > 80 ? cmd.slice(0, 80) + '\u2026' : cmd}`
+                } else if (input.pattern) {
+                  detail = `: ${input.pattern}`
+                } else if (input.file_path) {
+                  detail = `: ${input.file_path}`
+                } else if (input.query) {
+                  detail = `: ${input.query}`
+                }
+                queueRelay('\u{1203C}', `${name}${detail}`)
               }
-              queueRelay('\u{1203C}', `${name}${detail}`)
+            }
+          } else if (entry.type === 'user') {
+            for (const block of content) {
+              if (block.type !== 'tool_result') continue
+              const toolId = block.tool_use_id || ''
+              const toolName = pendingToolCalls.get(toolId) || 'tool'
+              pendingToolCalls.delete(toolId)
+              const isError = block.is_error === true
+              const raw = typeof block.content === 'string'
+                ? block.content
+                : JSON.stringify(block.content)
+              if (!raw?.trim()) continue
+              // Truncate long results (file reads, large outputs)
+              const MAX_RESULT = 300
+              const truncated = raw.length > MAX_RESULT
+                ? raw.slice(0, MAX_RESULT) + `\u2026 (${raw.length} chars)`
+                : raw
+              const label = isError ? `${toolName} error` : `${toolName} result`
+              queueRelay('\u{1203C}', `${label}:\n${truncated}`)
             }
           }
         } catch {
