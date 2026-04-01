@@ -49,8 +49,12 @@ let tailOffset = 0
 let tailInterval: ReturnType<typeof setInterval> | null = null
 let pendingMessages: Array<{ prefix: string; text: string }> = []
 let debounceTimer: ReturnType<typeof setTimeout> | null = null
-// Map tool_use IDs to tool names for pairing with tool_result
-const pendingToolCalls = new Map<string, string>()
+// Map tool_use IDs to { name, sentMessageIds } for edit-on-result
+const pendingToolCalls = new Map<string, {
+  name: string
+  description: string
+  sentIds: Map<string, number>  // chat_id → telegram message_id
+}>()
 
 function readActiveSession(): ActiveSession | null {
   try {
@@ -82,17 +86,7 @@ function flushRelay(): void {
   const access = loadAccess()
 
   for (const { prefix, text } of messages) {
-    // Tool calls are short — send as plain text, no markdown conversion
-    if (prefix === '\u{1203C}') {
-      for (const chat_id of access.allowFrom) {
-        void bot.api.sendMessage(chat_id, `${prefix} ${text}`).catch(err => {
-          process.stderr.write(`telegram channel: transcript relay failed: ${err}\n`)
-        })
-      }
-      continue
-    }
-
-    // Text messages (💭/✅) — convert markdown to Telegram HTML
+    // Convert markdown to Telegram HTML
     const html = markdownToTelegramHtml(text)
     const chunks = splitHtmlChunks(`${prefix} ${html}`, MAX_MSG_LEN)
     for (const chat_id of access.allowFrom) {
@@ -109,6 +103,43 @@ function flushRelay(): void {
         })
       }
     }
+  }
+}
+
+// Send a tool call message immediately (not debounced) and track its
+// Telegram message ID so we can edit it when the result arrives.
+function sendToolCall(toolId: string, name: string, detail: string): void {
+  const access = loadAccess()
+  const text = `\u{1203C} ${name}${detail}`
+  const entry = pendingToolCalls.get(toolId)
+  if (!entry) return
+
+  for (const chat_id of access.allowFrom) {
+    void bot.api.sendMessage(chat_id, text).then(
+      sent => { entry.sentIds.set(chat_id, sent.message_id) },
+      err => { process.stderr.write(`telegram channel: tool call relay failed: ${err}\n`) },
+    )
+  }
+}
+
+// Edit the original tool call message to append the result.
+function editToolResult(toolId: string, result: string, isError: boolean): void {
+  const entry = pendingToolCalls.get(toolId)
+  if (!entry) return
+  pendingToolCalls.delete(toolId)
+
+  const MAX_RESULT = 300
+  const truncated = result.length > MAX_RESULT
+    ? result.slice(0, MAX_RESULT) + `\u2026 (${result.length} chars)`
+    : result
+  const label = isError ? '\u274C' : '\u2192'
+  const newText = `\u{1203C} ${entry.name}: ${entry.description}\n${label} ${truncated}`
+
+  for (const [chat_id, msgId] of entry.sentIds) {
+    void bot.api.editMessageText(chat_id, msgId, newText).catch(err => {
+      // If edit fails (message too old, etc), send as new message
+      void bot.api.sendMessage(chat_id, newText).catch(() => {})
+    })
   }
 }
 
@@ -168,42 +199,36 @@ function startTailing(session: ActiveSession): void {
                 const name = block.name || 'unknown'
                 const id = block.id || ''
                 const input = block.input ?? {}
-                if (id) pendingToolCalls.set(id, name)
-                // Build a concise tool summary
+                // Build a concise tool description
                 let detail = ''
                 if (input.description) {
-                  detail = `: ${input.description}`
+                  detail = input.description
                 } else if (input.command) {
                   const cmd = String(input.command)
-                  detail = `: ${cmd.length > 80 ? cmd.slice(0, 80) + '\u2026' : cmd}`
+                  detail = cmd.length > 80 ? cmd.slice(0, 80) + '\u2026' : cmd
                 } else if (input.pattern) {
-                  detail = `: ${input.pattern}`
+                  detail = input.pattern
                 } else if (input.file_path) {
-                  detail = `: ${input.file_path}`
+                  detail = input.file_path
                 } else if (input.query) {
-                  detail = `: ${input.query}`
+                  detail = input.query
                 }
-                queueRelay('\u{1203C}', `${name}${detail}`)
+                if (id) {
+                  pendingToolCalls.set(id, { name, description: detail, sentIds: new Map() })
+                  sendToolCall(id, name, detail ? `: ${detail}` : '')
+                }
               }
             }
           } else if (entry.type === 'user') {
             for (const block of content) {
               if (block.type !== 'tool_result') continue
               const toolId = block.tool_use_id || ''
-              const toolName = pendingToolCalls.get(toolId) || 'tool'
-              pendingToolCalls.delete(toolId)
               const isError = block.is_error === true
               const raw = typeof block.content === 'string'
                 ? block.content
                 : JSON.stringify(block.content)
               if (!raw?.trim()) continue
-              // Truncate long results (file reads, large outputs)
-              const MAX_RESULT = 300
-              const truncated = raw.length > MAX_RESULT
-                ? raw.slice(0, MAX_RESULT) + `\u2026 (${raw.length} chars)`
-                : raw
-              const label = isError ? `${toolName} error` : `${toolName} result`
-              queueRelay('\u{1203C}', `${label}:\n${truncated}`)
+              editToolResult(toolId, raw.trim(), isError)
             }
           }
         } catch {
