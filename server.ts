@@ -47,7 +47,7 @@ let currentSession: ActiveSession | null = null
 let tailFd: number | null = null
 let tailOffset = 0
 let tailInterval: ReturnType<typeof setInterval> | null = null
-let pendingText = ''
+let pendingMessages: Array<{ prefix: string; text: string }> = []
 let debounceTimer: ReturnType<typeof setTimeout> | null = null
 
 function readActiveSession(): ActiveSession | null {
@@ -63,32 +63,49 @@ function stopTailing(): void {
   if (tailInterval) { clearInterval(tailInterval); tailInterval = null }
   if (tailFd !== null) { try { closeSync(tailFd) } catch {}; tailFd = null }
   if (debounceTimer) { clearTimeout(debounceTimer); debounceTimer = null }
-  flushPending()
+  flushRelay()
   tailOffset = 0
   currentSession = null
 }
 
-function flushPending(): void {
-  if (!pendingText.trim()) { pendingText = ''; return }
-  const text = pendingText.trim()
-  pendingText = ''
-  // Convert markdown to Telegram HTML and send to all allowlisted chats
-  const html = markdownToTelegramHtml(text)
-  const chunks = splitHtmlChunks(`💭 ${html}`, MAX_MSG_LEN)
+function queueRelay(prefix: string, text: string): void {
+  pendingMessages.push({ prefix, text })
+  if (debounceTimer) clearTimeout(debounceTimer)
+  debounceTimer = setTimeout(flushRelay, DEBOUNCE_MS)
+}
+
+function flushRelay(): void {
+  if (pendingMessages.length === 0) return
+  const messages = pendingMessages.splice(0)
   const access = loadAccess()
-  for (const chat_id of access.allowFrom) {
-    for (const c of chunks) {
-      void bot.api.sendMessage(chat_id, c, { parse_mode: 'HTML' }).catch(err => {
-        // Fall back to plain text on HTML parse error
-        if (err instanceof GrammyError && (err as GrammyError).error_code === 400) {
-          const plainChunks = chunkText(`💭 ${text}`, MAX_MSG_LEN)
-          for (const pc of plainChunks) {
-            void bot.api.sendMessage(chat_id, pc).catch(() => {})
-          }
-        } else {
+
+  for (const { prefix, text } of messages) {
+    // Tool calls are short — send as plain text, no markdown conversion
+    if (prefix === '🛠️') {
+      for (const chat_id of access.allowFrom) {
+        void bot.api.sendMessage(chat_id, `${prefix} ${text}`).catch(err => {
           process.stderr.write(`telegram channel: transcript relay failed: ${err}\n`)
-        }
-      })
+        })
+      }
+      continue
+    }
+
+    // Text messages (💭/✅) — convert markdown to Telegram HTML
+    const html = markdownToTelegramHtml(text)
+    const chunks = splitHtmlChunks(`${prefix} ${html}`, MAX_MSG_LEN)
+    for (const chat_id of access.allowFrom) {
+      for (const c of chunks) {
+        void bot.api.sendMessage(chat_id, c, { parse_mode: 'HTML' }).catch(err => {
+          if (err instanceof GrammyError && (err as GrammyError).error_code === 400) {
+            const plainChunks = chunkText(`${prefix} ${text}`, MAX_MSG_LEN)
+            for (const pc of plainChunks) {
+              void bot.api.sendMessage(chat_id, pc).catch(() => {})
+            }
+          } else {
+            process.stderr.write(`telegram channel: transcript relay failed: ${err}\n`)
+          }
+        })
+      }
     }
   }
 }
@@ -135,16 +152,34 @@ function startTailing(session: ActiveSession): void {
         try {
           const entry = JSON.parse(line)
           if (entry.type !== 'assistant') continue
-          const content = entry.message?.content
+          const msg = entry.message
+          const content = msg?.content
           if (!Array.isArray(content)) continue
+          const stopReason = msg?.stop_reason
+
           for (const block of content) {
             if (block.type === 'text' && block.text?.trim()) {
-              pendingText += (pendingText ? '\n' : '') + block.text.trim()
-              // Debounce — wait for more fragments before sending
-              if (debounceTimer) clearTimeout(debounceTimer)
-              debounceTimer = setTimeout(flushPending, DEBOUNCE_MS)
+              const prefix = stopReason === 'end_turn' ? '✅' : '💭'
+              queueRelay(prefix, block.text.trim())
+            } else if (block.type === 'tool_use') {
+              const name = block.name || 'unknown'
+              const input = block.input ?? {}
+              // Build a concise tool summary
+              let detail = ''
+              if (input.description) {
+                detail = `: ${input.description}`
+              } else if (input.command) {
+                const cmd = String(input.command)
+                detail = `: ${cmd.length > 80 ? cmd.slice(0, 80) + '…' : cmd}`
+              } else if (input.pattern) {
+                detail = `: ${input.pattern}`
+              } else if (input.file_path) {
+                detail = `: ${input.file_path}`
+              } else if (input.query) {
+                detail = `: ${input.query}`
+              }
+              queueRelay('🛠️', `${name}${detail}`)
             }
-            // Skip tool_use blocks — user only wants thinking text
           }
         } catch {
           // Not valid JSON — skip (partial line, etc.)
