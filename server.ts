@@ -22,6 +22,7 @@ import { randomBytes } from 'crypto'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, watchFile, unwatchFile, openSync, readSync, closeSync, existsSync } from 'fs'
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
+import { markdownToTelegramHtml, splitHtmlChunks } from './telegram-format.js'
 
 // ── JSONL transcript tailer ─────────────────────────────────────────────
 // Watches ~/.claude/channels/telegram/active-session.json (written by a
@@ -71,14 +72,22 @@ function flushPending(): void {
   if (!pendingText.trim()) { pendingText = ''; return }
   const text = pendingText.trim()
   pendingText = ''
-  // Send to all allowlisted chats (fire-and-forget)
+  // Convert markdown to Telegram HTML and send to all allowlisted chats
+  const html = markdownToTelegramHtml(text)
+  const chunks = splitHtmlChunks(`💭 ${html}`, MAX_MSG_LEN)
   const access = loadAccess()
   for (const chat_id of access.allowFrom) {
-    // Split if needed
-    const chunks = text.length <= MAX_MSG_LEN ? [text] : chunkText(text, MAX_MSG_LEN)
     for (const c of chunks) {
-      void bot.api.sendMessage(chat_id, `💭 ${c}`).catch(err => {
-        process.stderr.write(`telegram channel: transcript relay failed: ${err}\n`)
+      void bot.api.sendMessage(chat_id, c, { parse_mode: 'HTML' }).catch(err => {
+        // Fall back to plain text on HTML parse error
+        if (err instanceof GrammyError && (err as GrammyError).error_code === 400) {
+          const plainChunks = chunkText(`💭 ${text}`, MAX_MSG_LEN)
+          for (const pc of plainChunks) {
+            void bot.api.sendMessage(chat_id, pc).catch(() => {})
+          }
+        } else {
+          process.stderr.write(`telegram channel: transcript relay failed: ${err}\n`)
+        }
       })
     }
   }
@@ -499,6 +508,52 @@ function chunk(text: string, limit: number, mode: 'length' | 'newline'): string[
   return out
 }
 
+// ── Formatted send middleware ───────────────────────────────────────────
+// All outbound text goes through this. Converts markdown to Telegram HTML,
+// splits into tag-safe chunks, sends with parse_mode HTML. Falls back to
+// plain text on Telegram parse errors (400 Bad Request).
+
+async function sendFormatted(
+  chat_id: string,
+  text: string,
+  opts?: { reply_to?: number },
+): Promise<number[]> {
+  const html = markdownToTelegramHtml(text)
+  const chunks = splitHtmlChunks(html, MAX_CHUNK_LIMIT)
+  const access = loadAccess()
+  const replyMode = access.replyToMode ?? 'first'
+  const sentIds: number[] = []
+
+  for (let i = 0; i < chunks.length; i++) {
+    const shouldReplyTo =
+      opts?.reply_to != null &&
+      replyMode !== 'off' &&
+      (replyMode === 'all' || i === 0)
+    const replyParams = shouldReplyTo
+      ? { reply_parameters: { message_id: opts!.reply_to! } }
+      : {}
+    try {
+      const sent = await bot.api.sendMessage(chat_id, chunks[i], {
+        parse_mode: 'HTML',
+        ...replyParams,
+      })
+      sentIds.push(sent.message_id)
+    } catch (err) {
+      // Telegram rejected our HTML — fall back to plain text
+      if (err instanceof GrammyError && err.error_code === 400) {
+        const fallbackChunks = chunk(text, MAX_CHUNK_LIMIT, 'length')
+        for (const fc of fallbackChunks) {
+          const sent = await bot.api.sendMessage(chat_id, fc, replyParams)
+          sentIds.push(sent.message_id)
+        }
+        return sentIds
+      }
+      throw err
+    }
+  }
+  return sentIds
+}
+
 // .jpg/.jpeg/.png/.gif/.webp go as photos (Telegram compresses + shows inline);
 // everything else goes as documents (raw file, no compression).
 const PHOTO_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp'])
@@ -586,11 +641,6 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             items: { type: 'string' },
             description: 'Absolute file paths to attach. Images send as photos (inline preview); other types as documents. Max 50MB each.',
           },
-          format: {
-            type: 'string',
-            enum: ['text', 'markdownv2'],
-            description: "Rendering mode. 'markdownv2' enables Telegram formatting (bold, italic, code, links). Caller must escape special chars per MarkdownV2 rules. Default: 'text' (plain, no escaping needed).",
-          },
         },
         required: ['chat_id', 'text'],
       },
@@ -628,11 +678,6 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           chat_id: { type: 'string' },
           message_id: { type: 'string' },
           text: { type: 'string' },
-          format: {
-            type: 'string',
-            enum: ['text', 'markdownv2'],
-            description: "Rendering mode. 'markdownv2' enables Telegram formatting (bold, italic, code, links). Caller must escape special chars per MarkdownV2 rules. Default: 'text' (plain, no escaping needed).",
-          },
         },
         required: ['chat_id', 'message_id', 'text'],
       },
@@ -649,8 +694,6 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const text = args.text as string
         const reply_to = args.reply_to != null ? Number(args.reply_to) : undefined
         const files = (args.files as string[] | undefined) ?? []
-        const format = (args.format as string | undefined) ?? 'text'
-        const parseMode = format === 'markdownv2' ? 'MarkdownV2' as const : undefined
 
         assertAllowedChat(chat_id)
 
@@ -662,34 +705,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           }
         }
 
-        const access = loadAccess()
-        const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
-        const mode = access.chunkMode ?? 'length'
-        const replyMode = access.replyToMode ?? 'first'
-        const chunks = chunk(text, limit, mode)
-        const sentIds: number[] = []
-
-        try {
-          for (let i = 0; i < chunks.length; i++) {
-            const shouldReplyTo =
-              reply_to != null &&
-              replyMode !== 'off' &&
-              (replyMode === 'all' || i === 0)
-            const sent = await bot.api.sendMessage(chat_id, chunks[i], {
-              ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
-              ...(parseMode ? { parse_mode: parseMode } : {}),
-            })
-            sentIds.push(sent.message_id)
-          }
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err)
-          throw new Error(
-            `reply failed after ${sentIds.length} of ${chunks.length} chunk(s) sent: ${msg}`,
-          )
-        }
+        const sentIds = await sendFormatted(chat_id, text, { reply_to })
 
         // Files go as separate messages (Telegram doesn't mix text+file in one
         // sendMessage call). Thread under reply_to if present.
+        const access = loadAccess()
+        const replyMode = access.replyToMode ?? 'first'
         for (const f of files) {
           const ext = extname(f).toLowerCase()
           const input = new InputFile(f)
@@ -738,14 +759,25 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       }
       case 'edit_message': {
         assertAllowedChat(args.chat_id as string)
-        const editFormat = (args.format as string | undefined) ?? 'text'
-        const editParseMode = editFormat === 'markdownv2' ? 'MarkdownV2' as const : undefined
-        const edited = await bot.api.editMessageText(
-          args.chat_id as string,
-          Number(args.message_id),
-          args.text as string,
-          ...(editParseMode ? [{ parse_mode: editParseMode }] : []),
-        )
+        const editHtml = markdownToTelegramHtml(args.text as string)
+        let edited: any
+        try {
+          edited = await bot.api.editMessageText(
+            args.chat_id as string,
+            Number(args.message_id),
+            editHtml,
+            { parse_mode: 'HTML' },
+          )
+        } catch (err) {
+          // Fall back to plain text on HTML parse error
+          if (err instanceof GrammyError && err.error_code === 400) {
+            edited = await bot.api.editMessageText(
+              args.chat_id as string,
+              Number(args.message_id),
+              args.text as string,
+            )
+          } else throw err
+        }
         const id = typeof edited === 'object' ? edited.message_id : args.message_id
         return { content: [{ type: 'text', text: `edited (id: ${id})` }] }
       }
