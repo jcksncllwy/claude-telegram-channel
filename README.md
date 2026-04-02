@@ -96,3 +96,41 @@ assistant needs earlier context, it will ask you to paste or summarize.
 This also means there's no `download_attachment` tool for historical messages
 — photos are downloaded eagerly on arrival since there's no way to fetch them
 later.
+
+## Fork additions
+
+This is a fork of the official plugin at
+`anthropics/claude-plugins-official/external_plugins/telegram`.
+
+**What this fork adds:**
+
+- **JSONL transcript tailer** — watches the active session's JSONL transcript
+  and forwards assistant messages to all allowlisted Telegram chats in
+  real-time, without waiting for an explicit `reply` tool call.
+
+- **Markdown-to-HTML** (`telegram-format.ts`) — converts Claude's markdown
+  output to Telegram's supported HTML subset (bold, italic, code, blockquote,
+  tables) before sending. Falls back to plain text on parse errors.
+
+- **Tool call relay with edit-on-result** — when Claude invokes a tool, a
+  message is sent immediately showing the tool name and description. When the
+  result arrives, the message is edited in-place to show the outcome.
+
+- **Session notification hook** — the tailer reads
+  `~/.claude/channels/telegram/active-session.json` (written by a SessionStart
+  hook) and tails that session's transcript file automatically.
+
+**Module structure:**
+
+| File | Contents |
+| --- | --- |
+| `server.ts` | Entry point: MCP server, tools, bot startup, message handlers |
+| `access.ts` | Access control: types, pairing, allowlists, gate logic |
+| `transcript-tailer.ts` | JSONL tailer: session polling, line processing, relay |
+| `permissions.ts` | Permission relay: notification handler, inline keyboard |
+| `telegram-format.ts` | Markdown → Telegram HTML converter and HTML chunker |
+
+**Syncing with upstream:** periodically diff against
+`anthropics/claude-plugins-official/external_plugins/telegram/server.ts`.
+The access control, tool definitions, and inbound handler are the most likely
+areas to diverge.
