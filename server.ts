@@ -53,8 +53,19 @@ let debounceTimer: ReturnType<typeof setTimeout> | null = null
 const pendingToolCalls = new Map<string, {
   name: string
   description: string
+  createdAt: number
   sentIds: Map<string, number>  // chat_id → telegram message_id
 }>()
+
+// Expire stale pendingToolCalls entries every 60s (e.g. tool_use with no result)
+const TOOL_CALL_TTL_MS = 60_000
+const toolCallCleanup = setInterval(() => {
+  const cutoff = Date.now() - TOOL_CALL_TTL_MS
+  for (const [id, entry] of pendingToolCalls) {
+    if (entry.createdAt < cutoff) pendingToolCalls.delete(id)
+  }
+}, 60_000)
+toolCallCleanup.unref()
 
 function readActiveSession(): ActiveSession | null {
   try {
@@ -214,7 +225,7 @@ function startTailing(session: ActiveSession): void {
                   detail = input.query
                 }
                 if (id) {
-                  pendingToolCalls.set(id, { name, description: detail, sentIds: new Map() })
+                  pendingToolCalls.set(id, { name, description: detail, createdAt: Date.now(), sentIds: new Map() })
                   sendToolCall(id, name, detail ? `: ${detail}` : '')
                 }
               }
