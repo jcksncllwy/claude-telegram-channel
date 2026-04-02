@@ -4,16 +4,21 @@
 # SessionStart: writes session info so the plugin can tail the JSONL.
 # SessionEnd: clears the file so the plugin stops tailing.
 
+if ! command -v jq &>/dev/null; then
+  echo "telegram-session-notify: jq is required but not installed" >&2
+  exit 1
+fi
+
 ACTIVE_FILE="$HOME/.claude/channels/telegram/active-session.json"
 
 INPUT=$(cat)
-EVENT=$(echo "$INPUT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('hook_event_name',''))" 2>/dev/null)
+EVENT=$(echo "$INPUT" | jq -r '.hook_event_name // empty')
 
 if [ "$EVENT" = "SessionStart" ]; then
-  SESSION_ID=$(echo "$INPUT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('session_id',''))" 2>/dev/null)
-  TRANSCRIPT=$(echo "$INPUT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('transcript_path',''))" 2>/dev/null)
-  CWD=$(echo "$INPUT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('cwd',''))" 2>/dev/null)
-  MODEL=$(echo "$INPUT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('model',''))" 2>/dev/null)
+  SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty')
+  TRANSCRIPT=$(echo "$INPUT" | jq -r '.transcript_path // empty')
+  CWD=$(echo "$INPUT" | jq -r '.cwd // empty')
+  MODEL=$(echo "$INPUT" | jq -r '.model // empty')
 
   mkdir -p "$(dirname "$ACTIVE_FILE")"
   cat > "$ACTIVE_FILE" <<EOF

@@ -1,0 +1,10 @@
+{
+  "name": "telegram",
+  "description": "Telegram channel for Claude Code — messaging bridge with JSONL transcript relay, markdown formatting, and built-in access control.",
+  "version": "0.0.1",
+  "author": {
+    "name": "Jackson Callaway"
+  },
+  "license": "Apache-2.0",
+  "keywords": ["telegram", "messaging", "channel", "mcp"]
+}
