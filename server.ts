@@ -91,7 +91,9 @@ function queueRelay(prefix: string, text: string): void {
   debounceTimer = setTimeout(flushRelay, DEBOUNCE_MS)
 }
 
-function flushRelay(): void {
+const RELAY_SEND_DELAY_MS = 75  // throttle between sequential sends
+
+async function flushRelay(): Promise<void> {
   if (pendingMessages.length === 0) return
   const messages = pendingMessages.splice(0)
   const access = loadAccess()
@@ -102,16 +104,37 @@ function flushRelay(): void {
     const chunks = splitHtmlChunks(`${prefix} ${html}`, MAX_MSG_LEN)
     for (const chat_id of access.allowFrom) {
       for (const c of chunks) {
-        void bot.api.sendMessage(chat_id, c, { parse_mode: 'HTML' }).catch(err => {
-          if (err instanceof GrammyError && (err as GrammyError).error_code === 400) {
+        try {
+          await bot.api.sendMessage(chat_id, c, { parse_mode: 'HTML' })
+        } catch (err) {
+          if (err instanceof GrammyError && err.error_code === 429) {
+            // Telegram rate limit — wait the requested period and retry once
+            const retryAfter = (err.parameters?.retry_after ?? 5) * 1000
+            await new Promise(r => setTimeout(r, retryAfter))
+            try {
+              await bot.api.sendMessage(chat_id, c, { parse_mode: 'HTML' })
+            } catch { /* give up on this chunk */ }
+          } else if (err instanceof GrammyError && err.error_code === 400) {
+            // HTML parse error — fall back to plain text
             const plainChunks = chunkText(`${prefix} ${text}`, MAX_MSG_LEN)
             for (const pc of plainChunks) {
-              void bot.api.sendMessage(chat_id, pc).catch(() => {})
+              try {
+                await bot.api.sendMessage(chat_id, pc)
+              } catch (e2) {
+                if (e2 instanceof GrammyError && e2.error_code === 429) {
+                  const retryAfter = (e2.parameters?.retry_after ?? 5) * 1000
+                  await new Promise(r => setTimeout(r, retryAfter))
+                  await bot.api.sendMessage(chat_id, pc).catch(() => {})
+                }
+              }
+              await new Promise(r => setTimeout(r, RELAY_SEND_DELAY_MS))
             }
+            continue  // already sent plain fallback, skip the delay below
           } else {
             process.stderr.write(`telegram channel: transcript relay failed: ${err}\n`)
           }
-        })
+        }
+        await new Promise(r => setTimeout(r, RELAY_SEND_DELAY_MS))
       }
     }
   }
